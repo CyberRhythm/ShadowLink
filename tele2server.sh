@@ -594,9 +594,7 @@ do_install() {
 
     print_step "4" "Setting up Python environment"
     run_silent "Creating virtual environment   " python3 -m venv "${INSTALL_DIR}/venv"
-    run_silent "Installing Python packages     " \
-        "${INSTALL_DIR}/venv/bin/pip" install --quiet --upgrade pip \
-        pyrogram tgcrypto python-dotenv aiofiles aiohttp
+    run_silent "Installing Python packages     " "${INSTALL_DIR}/venv/bin/pip" install -q --upgrade pip pyrogram tgcrypto python-dotenv aiofiles aiohttp
 
     print_step "5" "Writing configuration"
     cat > "${INSTALL_DIR}/.env" << EOF
