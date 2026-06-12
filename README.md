@@ -68,7 +68,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CyberRhythm/ShadowLink/main/
 
 **گرفتن API_ID و API_HASH**
 
-برو به [my.telegram.org](https://my.telegram.org) و با شماره تلگرامت وارد شو. از بخش **API development tools** هر دو مقدار رو یادداشت کن.
+این دو مقدار رو از سایت رسمی تلگرام می‌گیری. مراحل رو دقیق دنبال کن:
+
+1. برو به [my.telegram.org](https://my.telegram.org)
+2. شماره تلگرامت رو با کد کشور وارد کن (مثلاً `+989123456789`)
+3. کد تأییدی که تلگرام برات می‌فرسته رو وارد کن
+4. روی **API development tools** کلیک کن
+5. یه فرم کوچیک میاد — هر چیزی دوست داری بنویس (اسم اپ و پلتفرم مهم نیست)
+6. بعد از submit، دو مقدار بهت نشون می‌ده:
+   - **App api_id** ← همون `API_ID`
+   - **App api_hash** ← همون `API_HASH`
+
+این دو مقدار رو کپی کن و یادداشت کن.
+
+> ⚠️ **خطا می‌ده؟**
+> اگه موقع ورود به my.telegram.org خطا گرفتی یا صفحه لود نشد، احتمالاً IP ایران فیلتره.
+> راه‌حل: برنامه رایگان **Cloudflare WARP** رو نصب کن، وصل شو، بعد دوباره امتحان کن.
+>
+> دانلود WARP: [one.one.one.one](https://one.one.one.one)
+> (برای ویندوز، اندروید، iOS و لینوکس موجوده)
 
 ### نصب آسان
 
