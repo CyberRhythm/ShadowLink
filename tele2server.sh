@@ -580,8 +580,9 @@ do_install() {
     run_silent "Upgrading packages             " apt-get upgrade -y -qq
 
     print_step "2" "Installing dependencies"
-    run_silent "Installing Python3 & tools     " \
-        apt-get install -y -qq python3 python3-venv python3-pip curl rar unrar
+    run_silent "Installing system packages      " apt-get install -y -qq python3 python3-venv python3-pip python3-dev gcc curl rar unrar
+
+
 
     print_step "3" "Preparing directory"
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
