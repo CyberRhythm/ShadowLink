@@ -1,0 +1,1625 @@
+From f2124528b8b9f0331e1a7e5396f3e99d36ced464 Mon Sep 17 00:00:00 2001
+From: ShadowLink Contributor <contributor@users.noreply.github.com>
+Date: Sat, 13 Jun 2026 15:43:01 +0000
+Subject: [PATCH] Professional rewrite: robustness, bandwidth guard & reliable
+ rar
+
+Both bots fully rewritten and verified with real testing in a sandbox
+(syntax + import + logic + a full encrypted multi-volume RAR roundtrip +
+end-to-end installer simulation on a clean venv).
+
+tg2bale (Telegram -> Bale):
+- Pre-download size guard: skip files over Telegram's 20MB bot limit so no
+  bandwidth is wasted on undeliverable files (core fix for weak connections)
+- Replace bare excepts with specific exception handling (no more swallowed
+  KeyboardInterrupt/CancelledError)
+- 429/FloodWait-aware messaging with retries and exponential backoff (3/6/9s)
+- atomic tempfile.mkstemp instead of deprecated/insecure tempfile.mktemp
+- fail-fast env validation with clear messages
+- correct per-batch statistics; drop backlog on restart; no temp-file leaks
+
+tele2server (file splitter):
+- install_rar(): rar is NOT in Ubuntu default repos; try multiverse then fall
+  back to the official rarlab static binary (arch-aware). The old script
+  silently failed on Ubuntu 22.04, leaving compression broken
+- check rar exit code and surface the real error instead of a vague message
+- header-encrypted multi-volume archives (-hp), configurable PART_SIZE_MB
+- FloodWait handling on progress edits and document sends
+- strict env validation; never leak downloaded files on error paths
+
+installers (both .sh):
+- set -Eeuo pipefail with an ERR trap and failure-aware run_silent/spinner
+- input validation loops (token format, numeric IDs)
+- TERM-safe clear; idempotent reinstall
+
+README: documents new behavior + a troubleshooting table.
+---
+ README.md      |  33 ++-
+ tele2server.sh | 643 +++++++++++++++++++++++++++++++------------------
+ tg2bale.sh     | 533 ++++++++++++++++++++++++++++------------
+ 3 files changed, 824 insertions(+), 385 deletions(-)
+
+diff --git a/README.md b/README.md
+index f3b97e8..369cd1c 100644
+--- a/README.md
++++ b/README.md
+@@ -33,7 +33,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CyberRhythm/ShadowLink/main/
+ - چند فایل پشت هم → صف می‌شن و به ترتیب ارسال می‌شن ✅
+ - فایل `.apk` یا `.exe` → اسمشو تغییر می‌ده که بله قبول کنه ✅
+ - ارسال موفق → توی تلگرام با تاریخ شمسی بهت خبر می‌ده ✅
+-- ارسال ناموفق → تا ۳ بار دوباره تلاش می‌کنه ✅
++- ارسال ناموفق → با مکث افزایشی (۳/۶/۹ ثانیه) تا ۳ بار دوباره تلاش می‌کنه ✅
++- **قبل از دانلود، حجم فایل رو چک می‌کنه** — اگه از سقف مجاز تلگرام (۲۰ مگابایت) بزرگ‌تر باشه، اصلاً دانلود نمی‌کنه و بهت می‌گه از بخش Tele2Server استفاده کنی. این یعنی هیچ پهنای باندی روی فایل‌هایی که قابل ارسال نیستن هدر نمی‌ره (مخصوص شرایط نت ضعیف) ✅
++- در برابر محدودیت تلگرام (خطای 429) مقاومه و خودش صبر می‌کنه ✅
+ 
+ ---
+ 
+@@ -98,10 +100,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/CyberRhythm/ShadowLink/main/
+ 
+ - فایل بفرستی → ربات حجم و تعداد پارت‌ها رو نشون می‌ده ✅
+ - لینک مستقیم بفرستی → اطلاعات فایل رو می‌خونه و آماده می‌کنه ✅
+-- دکمه RAR 20MB → فایل رو فشرده می‌کنه و پارت‌ها رو می‌فرسته ✅
+-- هر پارت پسورد قوی رندم داره ✅
++- دکمه RAR 20MB → فایل رو به پارت‌های رمزگذاری‌شده فشرده می‌کنه و پارت‌ها رو می‌فرسته ✅
++- هر آرشیو پسورد قوی رندم داره (هم محتوا، هم نام فایل‌ها رمزگذاری می‌شه) ✅
+ - پسورد آخر توی پیام جداگانه ارسال می‌شه ✅
+ - دکمه لغو داخل پیام دانلود ✅
++- نصب `rar` هوشمنده: اگه روی اوبونتو از مخزن نصب نشد، نسخه رسمی rarlab رو خودکار دانلود و نصب می‌کنه ✅
++- اگه فشرده‌سازی شکست بخوره، خطای واقعی RAR رو بهت نشون می‌ده (نه پیام مبهم) ✅
++- فایل‌های موقت بعد از ۱۲ ساعت خودکار پاک می‌شن و در صورت خطا هم نشتی نمی‌مونن ✅
+ 
+ ### دستورات ربات
+ 
+@@ -138,6 +143,28 @@ systemctl restart tele2server
+ 
+ ---
+ 
++## رفع اشکال (Troubleshooting) 🛠
++
++**ربات استارت نمی‌خوره؟** اول لاگ رو ببین:
++```bash
++journalctl -u tg2bale -n 40 --no-pager       # برای بخش اول
++journalctl -u tele2server -n 40 --no-pager    # برای بخش دوم
++```
++
++| پیام خطا | معنی و راه‌حل |
++|---|---|
++| `[FATAL] Missing required env var: ...` | یکی از مقادیر `.env` خالیه. با گزینه «Reinstall» در منو دوباره مقادیر رو وارد کن. |
++| `[FATAL] Env var ... must be an integer` | شناسه عددی یا API_ID رو اشتباه (با حروف) وارد کردی. باید فقط عدد باشه. |
++| `rar binary not found` / فشرده‌سازی کار نمی‌کنه | اسکریپت خودش تلاش می‌کنه `rar` رو نصب کنه؛ اگه باز هم نشد دستی نصب کن: <br>`add-apt-repository -y multiverse && apt update && apt install -y rar unrar` |
++| فایل بزرگ‌تر از ۲۰MB در بخش اول ارسال نمی‌شه | این محدودیت خود تلگرام برای ربات‌هاست، نه باگ. از بخش **Tele2Server** برای تقسیم فایل استفاده کن. |
++| `my.telegram.org` باز نمی‌شه | IP ایران فیلتره — با **Cloudflare WARP** وصل شو و دوباره امتحان کن. |
++
++> 💡 این نسخه بازنویسی‌شده‌ست: مدیریت خطای کامل، بررسی حجم قبل از دانلود (صرفه‌جویی پهنای باند)،
++> تلاش مجدد هوشمند، نصب مطمئن `rar`، و اعتبارسنجی ورودی‌ها. همه‌ی منطق با تست واقعی
++> (از جمله تست کامل تقسیم/استخراج RAR) تأیید شده.
++
++---
++
+ ## لایسنس
+ 
+ MIT — هر کاری دوست داری باهاش بکن، فقط اسم پروژه رو نگه‌دار 🙂
+diff --git a/tele2server.sh b/tele2server.sh
+index 995e57f..a35136b 100644
+--- a/tele2server.sh
++++ b/tele2server.sh
+@@ -4,7 +4,8 @@
+ #  https://github.com/CyberRhythm/ShadowLink
+ # ================================================================
+ 
+-set -e
++set -Eeuo pipefail
++trap 'print_error "Unexpected error on line $LINENO (exit $?)."' ERR
+ 
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+@@ -21,7 +22,7 @@ SERVICE_NAME="tele2server"
+ 
+ # ── UI helpers ────────────────────────────────────────────────
+ print_banner() {
+-    clear
++    clear 2>/dev/null || true
+     echo -e "${CYAN}${BOLD}"
+     echo "  ████████╗███████╗██╗     ███████╗██████╗ ███████╗███████╗██████╗ ██╗   ██╗███████╗██████╗ "
+     echo "     ██╔══╝██╔════╝██║     ██╔════╝╚════██╗██╔════╝██╔════╝██╔══██╗██║   ██║██╔════╝██╔══██╗"
+@@ -66,7 +67,7 @@ spinner() {
+     while kill -0 "$pid" 2>/dev/null; do
+         printf "\r  ${CYAN}${spin:$i:1}${NC}  %s" "$msg"
+         i=$(( (i+1) % 10 ))
+-        sleep 0.08
++        sleep 0.08 || true
+     done
+     printf "\r  ${GREEN}✓${NC}  %-50s\n" "$msg"
+ }
+@@ -74,7 +75,13 @@ spinner() {
+ run_silent() {
+     local msg="$1"; shift
+     "$@" > /tmp/ts_out 2>&1 &
+-    spinner $! "$msg"
++    local pid=$!
++    spinner "$pid" "$msg"
++    if ! wait "$pid"; then
++        print_error "$msg — failed"
++        echo -e "  ${DIM}$(tail -n 5 /tmp/ts_out 2>/dev/null)${NC}"
++        return 1
++    fi
+ }
+ 
+ svc_active() {
+@@ -89,103 +96,225 @@ status_badge() {
+     fi
+ }
+ 
++# ── Robust rar installer ──────────────────────────────────────
++# `rar` is NOT in Ubuntu's default repos (it lives in `multiverse`, and on
++# 22.04 the package is often unavailable entirely). The original script
++# simply ran `apt-get install rar` and silently failed, leaving the bot
++# unable to compress anything. We try multiverse first, then fall back to
++# the official statically-linked binary from rarlab.com.
++install_rar() {
++    if command -v rar >/dev/null 2>&1; then
++        print_ok "rar already installed ($(command -v rar))"
++        return 0
++    fi
++
++    # Attempt 1: enable multiverse and install from apt.
++    add-apt-repository -y multiverse >/dev/null 2>&1 || true
++    apt-get update -qq >/dev/null 2>&1 || true
++    if apt-get install -y -qq rar unrar >/dev/null 2>&1 && command -v rar >/dev/null 2>&1; then
++        print_ok "rar installed via apt (multiverse)"
++        return 0
++    fi
++
++    # Attempt 2: official rarlab static binary (architecture-aware).
++    print_info "apt rar unavailable — installing official rarlab binary"
++    local arch url tmpdir
++    arch="$(uname -m)"
++    case "$arch" in
++        x86_64|amd64) url="https://www.rarlab.com/rar/rarlinux-x64-700.tar.gz" ;;
++        aarch64|arm64) url="https://www.rarlab.com/rar/rarlinux-arm-700.tar.gz" ;;
++        *) print_error "Unsupported architecture for rar: $arch"; return 1 ;;
++    esac
++    tmpdir="$(mktemp -d)"
++    if curl -fsSL "$url" -o "$tmpdir/rar.tgz" \
++        && tar -xzf "$tmpdir/rar.tgz" -C "$tmpdir" \
++        && install -m 0755 "$tmpdir/rar/rar" /usr/local/bin/rar \
++        && install -m 0755 "$tmpdir/rar/unrar" /usr/local/bin/unrar; then
++        rm -rf "$tmpdir"
++        print_ok "rar installed to /usr/local/bin (rarlab)"
++        return 0
++    fi
++    rm -rf "$tmpdir"
++    print_error "Failed to install rar. Compression will not work."
++    return 1
++}
++
+ # ── Write bot.py ──────────────────────────────────────────────
+ write_bot_py() {
+     cat > "${INSTALL_DIR}/bot.py" << 'BOTEOF'
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Tele2Server — Telegram file manager bot
++# https://github.com/CyberRhythm/ShadowLink
++#
++# Professional rewrite: validates env, verifies the `rar` binary, checks the
++# archiver exit code, handles FloodWait when editing progress messages, uses
++# atomic temp files, and never leaks downloaded files on errors.
++
+ import os
++import sys
+ import asyncio
+ import time
+ import hashlib
+ import secrets
++import shutil
+ import string
+ import subprocess
+-import aiohttp
+ from pathlib import Path
+-from datetime import datetime, timedelta
++
++import aiohttp
+ from dotenv import load_dotenv
+-from pyrogram import Client, filters
+-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
++
++try:
++    from pyrogram import Client, filters
++    from pyrogram.errors import FloodWait, MessageNotModified
++    from pyrogram.types import (Message, InlineKeyboardMarkup,
++                                InlineKeyboardButton)
++except ImportError:
++    sys.exit("[FATAL] pyrogram is not installed. Run: pip install pyrogram tgcrypto")
+ 
+ load_dotenv()
+ 
+-API_ID = int(os.getenv("API_ID"))
+-API_HASH = os.getenv("API_HASH")
+-BOT_TOKEN = os.getenv("BOT_TOKEN")
+-ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",")]
++
++# ── Env validation (fail fast, clear messages) ────────────────
++def _require_int(name: str) -> int:
++    raw = os.getenv(name)
++    if raw is None or raw.strip() == "":
++        sys.exit(f"[FATAL] Missing required env var: {name}")
++    try:
++        return int(raw.strip())
++    except ValueError:
++        sys.exit(f"[FATAL] Env var {name} must be an integer, got: {raw!r}")
++
++
++def _require_str(name: str) -> str:
++    raw = os.getenv(name)
++    if not raw or not raw.strip():
++        sys.exit(f"[FATAL] Missing required env var: {name}")
++    return raw.strip()
++
++
++API_ID = _require_int("API_ID")
++API_HASH = _require_str("API_HASH")
++BOT_TOKEN = _require_str("BOT_TOKEN")
++
++_allowed_raw = os.getenv("ALLOWED_USERS", "")
++ALLOWED_USERS = [int(x) for x in _allowed_raw.split(",") if x.strip().lstrip("-").isdigit()]
++if not ALLOWED_USERS:
++    sys.exit("[FATAL] ALLOWED_USERS must contain at least one numeric user id")
++
+ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/opt/tele2server/downloads"))
+-FILE_EXPIRE_HOURS = int(os.getenv("FILE_EXPIRE_HOURS", "12"))
++FILE_EXPIRE_HOURS = int(os.getenv("FILE_EXPIRE_HOURS", "12") or "12")
++PART_SIZE_MB = int(os.getenv("PART_SIZE_MB", "20") or "20")
++
++# Resolve the archiver once at startup. We accept `rar` (preferred, true
++# multi-volume) and fall back gracefully if it is missing.
++RAR_BIN = shutil.which("rar")
+ 
+ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ app = Client("tele2server", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+ 
+-pending_files: dict[int, dict] = {}
+-active_downloads: dict[int, dict] = {}
++pending_files: "dict[int, dict]" = {}
++active_downloads: "dict[int, dict]" = {}
++
++
++# ── Access control ────────────────────────────────────────────
++def _allowed(_, __, message) -> bool:
++    return bool(message.from_user) and message.from_user.id in ALLOWED_USERS
+ 
+-def allowed(_, __, message: Message):
+-    return message.from_user and message.from_user.id in ALLOWED_USERS
+ 
+-allowed_filter = filters.create(allowed)
++allowed_filter = filters.create(_allowed)
+ 
++
++# ── Formatting helpers ────────────────────────────────────────
+ def make_file_id(name: str) -> str:
+-    raw = f"{name}{time.time()}"
++    raw = f"{name}{time.time()}{secrets.token_hex(4)}"
+     return hashlib.md5(raw.encode()).hexdigest()[:16]
+ 
++
+ def pretty_size(size: float) -> str:
+-    for unit in ["B", "KB", "MB", "GB"]:
+-        if size < 1024:
++    for unit in ("B", "KB", "MB", "GB", "TB"):
++        if size < 1024 or unit == "TB":
+             return f"{size:.2f} {unit}"
+         size /= 1024
+-    return f"{size:.2f} GB"
++    return f"{size:.2f} TB"
++
+ 
+ def eta_text(seconds) -> str:
+     if not seconds or seconds <= 0:
+         return "unknown"
+     seconds = int(seconds)
+-    h = seconds // 3600
+-    m = (seconds % 3600) // 60
+-    s = seconds % 60
++    h, rem = divmod(seconds, 3600)
++    m, s = divmod(rem, 60)
+     if h:
+         return f"{h}h {m}m {s}s"
+     if m:
+         return f"{m}m {s}s"
+     return f"{s}s"
+ 
++
+ def progress_bar(percent: float, length: int = 12) -> str:
++    percent = max(0.0, min(100.0, percent))
+     filled = int(length * percent / 100)
+-    bar = "█" * filled + "░" * (length - filled)
+-    return f"[{bar}]"
++    return f"[{'█' * filled}{'░' * (length - filled)}]"
++
+ 
+ def generate_password(length: int = 16) -> str:
+     chars = string.ascii_letters + string.digits + "!@#$%^&*"
+-    return ''.join(secrets.choice(chars) for _ in range(length))
++    return "".join(secrets.choice(chars) for _ in range(length))
++
+ 
+ def calc_parts(size_bytes: int, part_mb: int) -> int:
++    if not size_bytes:
++        return 1
+     part = part_mb * 1024 * 1024
+-    return max(1, -(-size_bytes // part))
++    return max(1, -(-size_bytes // part))  # ceil division
++
++
++def is_direct_url(text: str) -> bool:
++    return text.startswith("http://") or text.startswith("https://")
++
++
++# ── Archiving (with real exit-code checking) ──────────────────
++def create_rar_parts(source_path: Path, out_dir: Path, base_name: str,
++                     password: str, part_mb: int):
++    """Create encrypted multi-volume RAR. Returns (parts, error_message)."""
++    if not RAR_BIN:
++        return [], "rar binary not found on server"
+ 
+-def create_rar_parts(source_path: Path, out_dir: Path, base_name: str, password: str, part_mb: int) -> list[Path]:
+     out_base = out_dir / base_name
+-    subprocess.run(
+-        ["rar", "a", "-m0", f"-p{password}", "-hp", f"-v{part_mb}m", "-ep",
+-         f"{out_base}.rar", str(source_path)],
+-        capture_output=True, text=True
+-    )
++    try:
++        proc = subprocess.run(
++            [RAR_BIN, "a", "-m0", f"-hp{password}", f"-v{part_mb}m", "-ep",
++             f"{out_base}.rar", str(source_path)],
++            capture_output=True, text=True, timeout=3600,
++        )
++    except subprocess.TimeoutExpired:
++        return [], "archiving timed out"
++    except OSError as e:
++        return [], f"failed to launch rar: {e}"
++
++    if proc.returncode != 0:
++        detail = (proc.stderr or proc.stdout or "").strip()[:300]
++        return [], f"rar exited with code {proc.returncode}: {detail}"
++
+     parts = sorted(out_dir.glob(f"{base_name}.part*.rar"))
+     if not parts:
+         single = out_dir / f"{base_name}.rar"
+         if single.exists():
+-            return [single]
+-    return parts
++            return [single], ""
++        return [], "rar produced no output files"
++    return parts, ""
+ 
+-def is_direct_url(text: str) -> bool:
+-    return text.startswith("http://") or text.startswith("https://")
+ 
+-async def get_url_info(url: str) -> tuple[int, str]:
++# ── URL helpers ───────────────────────────────────────────────
++async def get_url_info(url: str):
+     try:
+         async with aiohttp.ClientSession() as session:
+-            async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+-                size = int(resp.headers.get("Content-Length", 0))
++            async with session.head(url, allow_redirects=True,
++                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
++                size = int(resp.headers.get("Content-Length", 0) or 0)
+                 cd = resp.headers.get("Content-Disposition", "")
+                 fname = ""
+                 if "filename=" in cd:
+@@ -193,21 +322,39 @@ async def get_url_info(url: str) -> tuple[int, str]:
+                 if not fname:
+                     fname = str(resp.url).split("/")[-1].split("?")[0]
+                 return size, fname
+-    except Exception:
++    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+         return 0, ""
+ 
+-async def download_from_url(url: str, save_path: Path, status_msg, user_id: int) -> tuple[bool, str]:
++
++async def safe_edit(status_msg, text, reply_markup=None):
++    """Edit a message, transparently handling FloodWait & no-op edits."""
++    try:
++        await status_msg.edit(text, reply_markup=reply_markup)
++    except FloodWait as e:
++        await asyncio.sleep(e.value + 1)
++        try:
++            await status_msg.edit(text, reply_markup=reply_markup)
++        except Exception:
++            pass
++    except MessageNotModified:
++        pass
++    except Exception:
++        pass
++
++
++async def download_from_url(url: str, save_path: Path, status_msg, user_id: int):
+     try:
+         async with aiohttp.ClientSession() as session:
+-            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
++            async with session.get(url, allow_redirects=True,
++                                   timeout=aiohttp.ClientTimeout(total=3600)) as resp:
+                 if resp.status != 200:
+                     return False, f"HTTP {resp.status}"
+-                total = int(resp.headers.get("Content-Length", 0))
++                total = int(resp.headers.get("Content-Length", 0) or 0)
+                 downloaded = 0
+                 start_time = time.time()
+-                last_update = 0
+-                with open(save_path, 'wb') as f:
+-                    async for chunk in resp.content.iter_chunked(1024 * 64):
++                last_update = 0.0
++                with open(save_path, "wb") as f:
++                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                         if active_downloads.get(user_id, {}).get("cancelled"):
+                             return False, "cancelled"
+                         f.write(chunk)
+@@ -219,109 +366,132 @@ async def download_from_url(url: str, save_path: Path, status_msg, user_id: int)
+                             speed = downloaded / elapsed
+                             percent = (downloaded * 100 / total) if total else 0
+                             remaining = ((total - downloaded) / speed) if (total and speed) else 0
+-                            active_downloads[user_id].update({"downloaded": downloaded, "percent": percent})
+-                            try:
+-                                await status_msg.edit(
+-                                    f"📥 **Downloading from URL...**\n\n"
+-                                    f"📊 Progress: `{percent:.1f}%`\n"
+-                                    f"⬇️ Size: `{pretty_size(downloaded)}`"
+-                                    + (f" of `{pretty_size(total)}`" if total else "") + "\n"
+-                                    f"⚡ Speed: `{pretty_size(speed)}/s`\n"
+-                                    f"⏱ ETA: `{eta_text(remaining)}`\n\n"
+-                                    f"{progress_bar(percent)}",
+-                                    reply_markup=InlineKeyboardMarkup([[
+-                                        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dl_{user_id}")
+-                                    ]])
+-                                )
+-                            except Exception:
+-                                pass
++                            active_downloads[user_id].update(
++                                {"downloaded": downloaded, "percent": percent})
++                            await safe_edit(
++                                status_msg,
++                                f"📥 **Downloading from URL...**\n\n"
++                                f"📊 Progress: `{percent:.1f}%`\n"
++                                f"⬇️ Size: `{pretty_size(downloaded)}`"
++                                + (f" of `{pretty_size(total)}`" if total else "") + "\n"
++                                f"⚡ Speed: `{pretty_size(speed)}/s`\n"
++                                f"⏱ ETA: `{eta_text(remaining)}`\n\n"
++                                f"{progress_bar(percent)}",
++                                InlineKeyboardMarkup([[
++                                    InlineKeyboardButton("❌ Cancel",
++                                                         callback_data=f"cancel_dl_{user_id}")
++                                ]]),
++                            )
+         return True, ""
+-    except Exception as e:
++    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+         return False, str(e)
+ 
+-async def process_file(client, chat_id, status_msg, user_id, file_name, file_size, save_path):
+-    await status_msg.edit(
+-        f"🗜 **Archiving into 20MB parts...**\n\n"
+-        f"📄 File: `{file_name}`\n⏳ Please wait..."
+-    )
++
++# ── Compress + send pipeline ──────────────────────────────────
++async def process_file(client, chat_id, status_msg, user_id,
++                       file_name, file_size, save_path: Path):
++    await safe_edit(status_msg,
++                    f"🗜 **Archiving into {PART_SIZE_MB}MB parts...**\n\n"
++                    f"📄 File: `{file_name}`\n⏳ Please wait...")
++
++    base_name = make_file_id(file_name)
++    password = generate_password()
++    loop = asyncio.get_event_loop()
+     try:
+-        base_name = make_file_id(file_name)
+-        password = generate_password()
+-        loop = asyncio.get_event_loop()
+-        parts = await loop.run_in_executor(
+-            None, create_rar_parts, save_path, DOWNLOAD_DIR, base_name, password, 20
+-        )
+-        save_path.unlink(missing_ok=True)
+-    except Exception as e:
+-        await status_msg.edit(f"❌ Archive error:\n`{e}`")
+-        return
++        parts, err = await loop.run_in_executor(
++            None, create_rar_parts, save_path, DOWNLOAD_DIR,
++            base_name, password, PART_SIZE_MB)
++    except Exception as e:  # defensive: executor wrapper
++        parts, err = [], str(e)
++    finally:
++        # The source is no longer needed once handed to the archiver.
++        try:
++            save_path.unlink(missing_ok=True)
++        except OSError:
++            pass
+ 
+     if not parts:
+-        await status_msg.edit("❌ Failed to create archive.")
++        await safe_edit(status_msg, f"❌ Archive failed.\n`{err or 'unknown error'}`")
+         return
+ 
+-    await status_msg.edit(
+-        f"📤 **Sending {len(parts)} parts to Telegram...**\n\n"
+-        f"📄 File: `{file_name}`\n⏳ Please wait..."
+-    )
++    await safe_edit(status_msg,
++                    f"📤 **Sending {len(parts)} parts to Telegram...**\n\n"
++                    f"📄 File: `{file_name}`\n⏳ Please wait...")
+ 
+     all_sent = True
+     for i, part in enumerate(parts, 1):
+         try:
+             await client.send_document(
+-                chat_id=chat_id,
+-                document=str(part),
++                chat_id=chat_id, document=str(part),
+                 caption=f"📦 Part {i} of {len(parts)} — `{file_name}`",
+-                force_document=True
+-            )
++                force_document=True)
++        except FloodWait as e:
++            await asyncio.sleep(e.value + 1)
++            try:
++                await client.send_document(
++                    chat_id=chat_id, document=str(part),
++                    caption=f"📦 Part {i} of {len(parts)} — `{file_name}`",
++                    force_document=True)
++            except Exception as e2:
++                await client.send_message(chat_id, f"❌ Error sending part {i}:\n`{e2}`")
++                all_sent = False
+         except Exception as e:
+             await client.send_message(chat_id, f"❌ Error sending part {i}:\n`{e}`")
+             all_sent = False
+         finally:
+-            part.unlink(missing_ok=True)
+-
+-    msg = (
+-        f"✅ **All parts sent!**\n\n"
+-        f"📄 Original: `{file_name}`\n"
+-        f"📦 Parts: `{len(parts)}`\n\n"
+-        f"🔑 **Password:**\n`{password}`\n\n"
+-        f"📌 Download all parts, place them together, open `part1.rar` with WinRAR or ZArchiver."
+-    ) if all_sent else (
+-        f"⚠️ Some parts failed to send.\n\n🔑 **Password:**\n`{password}`"
+-    )
++            try:
++                part.unlink(missing_ok=True)
++            except OSError:
++                pass
++
++    if all_sent:
++        msg = (f"✅ **All parts sent!**\n\n"
++               f"📄 Original: `{file_name}`\n"
++               f"📦 Parts: `{len(parts)}`\n\n"
++               f"🔑 **Password:**\n`{password}`\n\n"
++               f"📌 Download all parts, place them together, "
++               f"open `part1.rar` with WinRAR or ZArchiver.")
++    else:
++        msg = f"⚠️ Some parts failed to send.\n\n🔑 **Password:**\n`{password}`"
+     await client.send_message(chat_id, msg)
+ 
++
+ def make_keyboard(user_id: int) -> InlineKeyboardMarkup:
+     return InlineKeyboardMarkup([
+-        [InlineKeyboardButton("🗜 RAR 20MB Parts", callback_data=f"upload_rar20_{user_id}")],
++        [InlineKeyboardButton(f"🗜 RAR {PART_SIZE_MB}MB Parts",
++                              callback_data=f"upload_rar_{user_id}")],
+     ])
+ 
++
++# ── Command handlers ──────────────────────────────────────────
+ @app.on_message(filters.command("start") & allowed_filter)
+-async def start(client, message: Message):
++async def start(client, message):
++    warn = "" if RAR_BIN else "\n\n⚠️ **هشدار:** ابزار `rar` روی سرور نصب نیست؛ فشرده‌سازی کار نمی‌کند."
+     await message.reply(
+         "👋 **Hello!**\n\n"
+-        "Send me a file or direct URL.\n"
+-        "I'll compress it into password-protected 20MB RAR parts and send them back.\n\n"
++        "Send me a file or a direct URL.\n"
++        f"I'll compress it into password-protected {PART_SIZE_MB}MB RAR parts "
++        "and send them back.\n\n"
+         "📋 `/queue` — active downloads\n"
+-        "❌ `/cancel` — cancel current download"
+-    )
++        "❌ `/cancel` — cancel current download" + warn)
++
+ 
+ @app.on_message(filters.command("queue") & allowed_filter)
+-async def queue_status(client, message: Message):
++async def queue_status(client, message):
+     if not active_downloads:
+         await message.reply("✅ Queue is empty.")
+         return
+     text = "📋 **Active Downloads:**\n\n"
+-    for uid, info in active_downloads.items():
+-        text += (
+-            f"🔹 **{info['name']}**\n"
+-            f"   ⬇️ {pretty_size(info.get('downloaded', 0))} of {pretty_size(info.get('total', 0))}\n"
+-            f"   📊 {info.get('percent', 0):.1f}%\n\n"
+-        )
++    for _, info in active_downloads.items():
++        text += (f"🔹 **{info['name']}**\n"
++                 f"   ⬇️ {pretty_size(info.get('downloaded', 0))} "
++                 f"of {pretty_size(info.get('total', 0))}\n"
++                 f"   📊 {info.get('percent', 0):.1f}%\n\n")
+     await message.reply(text)
+ 
++
+ @app.on_message(filters.command("cancel") & allowed_filter)
+-async def cancel_download(client, message: Message):
++async def cancel_download(client, message):
+     user_id = message.from_user.id
+     if user_id in active_downloads:
+         active_downloads[user_id]["cancelled"] = True
+@@ -329,69 +499,71 @@ async def cancel_download(client, message: Message):
+     else:
+         await message.reply("No active download found.")
+ 
+-@app.on_message(filters.text & allowed_filter & ~filters.command(["start", "queue", "cancel"]))
+-async def handle_url(client: Client, message: Message):
++
++@app.on_message(filters.text & allowed_filter
++                & ~filters.command(["start", "queue", "cancel"]))
++async def handle_url(client, message):
+     url = message.text.strip()
+     if not is_direct_url(url):
+         return
+     user_id = message.from_user.id
+-    checking_msg = await message.reply("🔍 Checking URL...")
++    checking = await message.reply("🔍 Checking URL...")
+     size, fname = await get_url_info(url)
+     if not fname or len(fname) < 3:
+         fname = url.split("/")[-1].split("?")[0] or f"file_{int(time.time())}"
+     size_text = pretty_size(size) if size else "Unknown"
+-    parts20 = calc_parts(size, 20) if size else "?"
+-    pending_files[user_id] = {"type": "url", "url": url, "file_name": fname, "file_size": size}
+-    await checking_msg.edit(
+-        f"🔗 **URL received**\n\n"
+-        f"📄 File: `{fname}`\n"
+-        f"📦 Size: `{size_text}`\n"
+-        f"🗂 Parts (20MB): `{parts20}`\n\n"
+-        "Ready to compress and send?",
+-        reply_markup=make_keyboard(user_id)
+-    )
+-
+-@app.on_message(
+-    allowed_filter &
+-    (filters.document | filters.video | filters.audio | filters.photo)
+-)
+-async def handle_file(client: Client, message: Message):
++    parts = calc_parts(size, PART_SIZE_MB) if size else "?"
++    pending_files[user_id] = {"type": "url", "url": url,
++                              "file_name": fname, "file_size": size}
++    await safe_edit(checking,
++                    f"🔗 **URL received**\n\n"
++                    f"📄 File: `{fname}`\n"
++                    f"📦 Size: `{size_text}`\n"
++                    f"🗂 Parts ({PART_SIZE_MB}MB): `{parts}`\n\n"
++                    "Ready to compress and send?",
++                    make_keyboard(user_id))
++
++
++@app.on_message(allowed_filter
++                & (filters.document | filters.video | filters.audio | filters.photo))
++async def handle_file(client, message):
+     user_id = message.from_user.id
+     if message.document:
+-        file = message.document
+-        file_name = file.file_name or f"file_{int(time.time())}"
+-        file_size = file.file_size
++        file_name = message.document.file_name or f"file_{int(time.time())}"
++        file_size = message.document.file_size
+     elif message.video:
+-        file = message.video
+         file_name = f"video_{int(time.time())}.mp4"
+-        file_size = file.file_size
++        file_size = message.video.file_size
+     elif message.audio:
+-        file = message.audio
+-        file_name = file.file_name or f"audio_{int(time.time())}.mp3"
+-        file_size = file.file_size
++        file_name = message.audio.file_name or f"audio_{int(time.time())}.mp3"
++        file_size = message.audio.file_size
+     elif message.photo:
+-        file = message.photo
+         file_name = f"photo_{int(time.time())}.jpg"
+-        file_size = file.file_size
++        file_size = message.photo.file_size
+     else:
+         return
+-    parts20 = calc_parts(file_size, 20)
+-    pending_files[user_id] = {"type": "telegram", "message": message, "file_name": file_name, "file_size": file_size}
++    parts = calc_parts(file_size, PART_SIZE_MB)
++    pending_files[user_id] = {"type": "telegram", "message": message,
++                              "file_name": file_name, "file_size": file_size}
+     await message.reply(
+         f"📄 **File received:** `{file_name}`\n"
+         f"📦 Size: `{pretty_size(file_size)}`\n"
+-        f"🗂 Parts (20MB): `{parts20}`\n\n"
++        f"🗂 Parts ({PART_SIZE_MB}MB): `{parts}`\n\n"
+         "Ready to compress and send?",
+-        reply_markup=make_keyboard(user_id)
+-    )
++        reply_markup=make_keyboard(user_id))
++
+ 
+ @app.on_callback_query()
+-async def handle_callback(client: Client, callback_query):
+-    data = callback_query.data
++async def handle_callback(client, callback_query):
++    data = callback_query.data or ""
+     user_id = callback_query.from_user.id
+ 
+     if data.startswith("cancel_dl_"):
+-        target_uid = int(data.split("_")[-1])
++        try:
++            target_uid = int(data.split("_")[-1])
++        except ValueError:
++            await callback_query.answer("Invalid request.", show_alert=True)
++            return
+         if target_uid in active_downloads:
+             active_downloads[target_uid]["cancelled"] = True
+             await callback_query.answer("❌ Cancel requested.")
+@@ -399,125 +571,134 @@ async def handle_callback(client: Client, callback_query):
+             await callback_query.answer("No active download.", show_alert=True)
+         return
+ 
+-    if not data.startswith("upload_rar20_"):
++    if not data.startswith("upload_rar_"):
++        return
++
++    if not RAR_BIN:
++        await callback_query.answer("⚠️ rar is not installed on the server.",
++                                    show_alert=True)
+         return
+ 
+     if user_id not in pending_files:
+-        await callback_query.answer("⚠️ File expired, please send again.", show_alert=True)
++        await callback_query.answer("⚠️ File expired, please send again.",
++                                    show_alert=True)
+         return
+ 
+     info = pending_files.pop(user_id)
+     file_name = info["file_name"]
+     chat_id = callback_query.message.chat.id
+ 
+-    await callback_query.message.edit_reply_markup(reply_markup=None)
++    try:
++        await callback_query.message.edit_reply_markup(reply_markup=None)
++    except Exception:
++        pass
+     await callback_query.answer()
+ 
+-    file_id_short = make_file_id(file_name)
+-    safe_name = f"{file_id_short}_{file_name}"
+-    save_path = DOWNLOAD_DIR / safe_name
++    safe_fname = f"{make_file_id(file_name)}_{os.path.basename(file_name)}"
++    save_path = DOWNLOAD_DIR / safe_fname
+ 
+     active_downloads[user_id] = {
+         "name": file_name, "total": info.get("file_size", 0),
+         "downloaded": 0, "percent": 0, "cancelled": False,
+     }
+-
+     cancel_btn = InlineKeyboardMarkup([[
+         InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dl_{user_id}")
+     ]])
+ 
+-    if info["type"] == "url":
+-        status_msg = await callback_query.message.reply(
+-            f"📥 **Downloading from URL...**\n\n🔗 `{info['url']}`\n\n{progress_bar(0)} 0%",
+-            reply_markup=cancel_btn
+-        )
+-        ok, err = await download_from_url(info["url"], save_path, status_msg, user_id)
+-        if not ok:
+-            active_downloads.pop(user_id, None)
+-            save_path.unlink(missing_ok=True)
+-            await status_msg.edit("❌ Download cancelled." if err == "cancelled" else f"❌ Error:\n`{err}`", reply_markup=None)
+-            return
+-        file_size = save_path.stat().st_size
+-        active_downloads.pop(user_id, None)
+-        await status_msg.edit_reply_markup(reply_markup=None)
+-        await process_file(client, chat_id, status_msg, user_id, file_name, file_size, save_path)
+-
+-    else:
+-        message = info["message"]
+-        file_size = info["file_size"]
+-        status_msg = await callback_query.message.reply(
+-            f"📥 **Downloading from Telegram...**\n\n"
+-            f"📄 File: `{file_name}`\n"
+-            f"📦 Size: `{pretty_size(file_size)}`\n\n"
+-            f"{progress_bar(0)} 0%",
+-            reply_markup=cancel_btn
+-        )
+-        start_time = time.time()
+-        last_update = [0]
+-
+-        async def progress(current, total):
+-            if active_downloads.get(user_id, {}).get("cancelled"):
+-                return
+-            now = time.time()
+-            if now - last_update[0] < 2 and current < total:
++    try:
++        if info["type"] == "url":
++            status_msg = await callback_query.message.reply(
++                f"📥 **Downloading from URL...**\n\n🔗 `{info['url']}`\n\n"
++                f"{progress_bar(0)} 0%", reply_markup=cancel_btn)
++            ok, err = await download_from_url(info["url"], save_path, status_msg, user_id)
++            if not ok:
++                save_path.unlink(missing_ok=True)
++                await safe_edit(status_msg,
++                                "❌ Download cancelled." if err == "cancelled"
++                                else f"❌ Error:\n`{err}`")
+                 return
+-            last_update[0] = now
+-            elapsed = max(now - start_time, 0.1)
+-            speed = current / elapsed
+-            remaining = (total - current) / speed if speed > 0 else 0
+-            percent = current * 100 / total if total else 0
+-            active_downloads[user_id].update({"downloaded": current, "percent": percent})
+-            try:
+-                await status_msg.edit(
++            file_size = save_path.stat().st_size
++            await safe_edit(status_msg, "✅ Downloaded. Preparing archive...")
++            await process_file(client, chat_id, status_msg, user_id,
++                               file_name, file_size, save_path)
++        else:
++            message = info["message"]
++            file_size = info["file_size"]
++            status_msg = await callback_query.message.reply(
++                f"📥 **Downloading from Telegram...**\n\n"
++                f"📄 File: `{file_name}`\n"
++                f"📦 Size: `{pretty_size(file_size)}`\n\n"
++                f"{progress_bar(0)} 0%", reply_markup=cancel_btn)
++            start_time = time.time()
++            last_update = [0.0]
++
++            async def progress(current, total):
++                if active_downloads.get(user_id, {}).get("cancelled"):
++                    return
++                now = time.time()
++                if now - last_update[0] < 2 and current < total:
++                    return
++                last_update[0] = now
++                elapsed = max(now - start_time, 0.1)
++                speed = current / elapsed
++                remaining = (total - current) / speed if speed > 0 else 0
++                percent = current * 100 / total if total else 0
++                active_downloads[user_id].update({"downloaded": current, "percent": percent})
++                await safe_edit(
++                    status_msg,
+                     f"📥 **Downloading from Telegram...**\n\n"
+                     f"📄 File: `{file_name}`\n"
+                     f"📊 Progress: `{percent:.1f}%`\n"
+                     f"⬇️ Size: `{pretty_size(current)}` of `{pretty_size(total)}`\n"
+                     f"⚡ Speed: `{pretty_size(speed)}/s`\n"
+                     f"⏱ ETA: `{eta_text(remaining)}`\n\n"
+-                    f"{progress_bar(percent)}",
+-                    reply_markup=cancel_btn
+-                )
+-            except Exception:
+-                pass
++                    f"{progress_bar(percent)}", cancel_btn)
+ 
+-        try:
+-            await client.download_media(message, file_name=str(save_path), progress=progress)
+-        except Exception as e:
+-            active_downloads.pop(user_id, None)
+-            await status_msg.edit(f"❌ Download error:\n`{e}`", reply_markup=None)
+-            return
++            try:
++                await client.download_media(message, file_name=str(save_path),
++                                            progress=progress)
++            except Exception as e:
++                save_path.unlink(missing_ok=True)
++                await safe_edit(status_msg, f"❌ Download error:\n`{e}`")
++                return
+ 
+-        if active_downloads.get(user_id, {}).get("cancelled"):
+-            active_downloads.pop(user_id, None)
+-            save_path.unlink(missing_ok=True)
+-            await status_msg.edit("❌ Download cancelled.", reply_markup=None)
+-            return
++            if active_downloads.get(user_id, {}).get("cancelled"):
++                save_path.unlink(missing_ok=True)
++                await safe_edit(status_msg, "❌ Download cancelled.")
++                return
+ 
++            await safe_edit(status_msg, "✅ Downloaded. Preparing archive...")
++            await process_file(client, chat_id, status_msg, user_id,
++                               file_name, file_size, save_path)
++    finally:
+         active_downloads.pop(user_id, None)
+-        await status_msg.edit_reply_markup(reply_markup=None)
+-        await process_file(client, chat_id, status_msg, user_id, file_name, file_size, save_path)
+ 
++
++# ── Maintenance ───────────────────────────────────────────────
+ async def cleanup_loop():
+     while True:
+         await asyncio.sleep(600)
+         now = time.time()
+         expire_seconds = FILE_EXPIRE_HOURS * 3600
+-        for f in DOWNLOAD_DIR.iterdir():
+-            if f.is_file():
+-                age = now - f.stat().st_mtime
+-                if age > expire_seconds:
++        try:
++            for f in DOWNLOAD_DIR.iterdir():
++                if f.is_file() and (now - f.stat().st_mtime) > expire_seconds:
+                     try:
+                         f.unlink()
+-                    except Exception:
++                    except OSError:
+                         pass
++        except OSError:
++            pass
++
+ 
+ async def main():
++    if not RAR_BIN:
++        print("[WARN] `rar` binary not found — compression will be disabled "
++              "until it is installed.", file=sys.stderr)
+     async with app:
+-        await asyncio.gather(
+-            asyncio.Event().wait(),
+-            cleanup_loop(),
+-        )
++        print(f"[OK] Tele2Server started. Allowed users: {ALLOWED_USERS}")
++        await asyncio.gather(asyncio.Event().wait(), cleanup_loop())
++
+ 
+ if __name__ == "__main__":
+     app.run(main())
+@@ -580,9 +761,8 @@ do_install() {
+     run_silent "Upgrading packages             " apt-get upgrade -y -qq
+ 
+     print_step "2" "Installing dependencies"
+-    run_silent "Installing system packages      " apt-get install -y -qq python3 python3-venv python3-pip python3-dev gcc curl rar unrar
+-
+-
++    run_silent "Installing base packages        " apt-get install -y -qq python3 python3-venv python3-pip python3-dev gcc curl tar software-properties-common
++    install_rar
+ 
+     print_step "3" "Preparing directory"
+     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+@@ -605,6 +785,7 @@ BOT_TOKEN=${BOT_TOKEN}
+ ALLOWED_USERS=${ALLOWED_USERS}
+ DOWNLOAD_DIR=${INSTALL_DIR}/downloads
+ FILE_EXPIRE_HOURS=12
++PART_SIZE_MB=20
+ EOF
+     chmod 600 "${INSTALL_DIR}/.env"
+     print_ok ".env written  (chmod 600)"
+diff --git a/tg2bale.sh b/tg2bale.sh
+index bc480cf..04b17f4 100644
+--- a/tg2bale.sh
++++ b/tg2bale.sh
+@@ -4,7 +4,9 @@
+ #  https://github.com/CyberRhythm/ShadowLink
+ # ================================================================
+ 
+-set -e
++# Fail on errors and unset vars, and propagate failures through pipes.
++set -Eeuo pipefail
++trap 'print_error "Unexpected error on line $LINENO (exit $?)."' ERR
+ 
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+@@ -21,7 +23,7 @@ SERVICE_NAME="tg2bale"
+ 
+ # ── UI helpers ────────────────────────────────────────────────
+ print_banner() {
+-    clear
++    clear 2>/dev/null || true
+     echo -e "${CYAN}${BOLD}"
+     echo "   ░██████╗██╗░░██╗░█████╗░██████╗░░█████╗░░██╗░░░░░░░██╗██╗░░░░░██╗███╗░░██╗██╗░░██╗"
+     echo "   ██╔════╝██║░░██║██╔══██╗██╔══██╗██╔══██╗░██║░░██╗░░██║██║░░░░░██║████╗░██║██║░██╔╝"
+@@ -66,15 +68,23 @@ spinner() {
+     while kill -0 "$pid" 2>/dev/null; do
+         printf "\r  ${CYAN}${spin:$i:1}${NC}  %s" "$msg"
+         i=$(( (i+1) % 10 ))
+-        sleep 0.08
++        sleep 0.08 || true
+     done
+     printf "\r  ${GREEN}✓${NC}  %-50s\n" "$msg"
+ }
+ 
+ run_silent() {
++    # Run a command quietly with a spinner; surface failures clearly
++    # instead of letting `set -e` abort with no context.
+     local msg="$1"; shift
+     "$@" > /tmp/sl_out 2>&1 &
+-    spinner $! "$msg"
++    local pid=$!
++    spinner "$pid" "$msg"
++    if ! wait "$pid"; then
++        print_error "$msg — failed"
++        echo -e "  ${DIM}$(tail -n 5 /tmp/sl_out 2>/dev/null)${NC}"
++        return 1
++    fi
+ }
+ 
+ svc_active() {
+@@ -94,195 +104,397 @@ write_bot_py() {
+     cat > "${INSTALL_DIR}/bot.py" << 'BOTEOF'
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-# ShadowLink — https://github.com/CyberRhythm/ShadowLink
+-
+-import asyncio, logging, os, tempfile, aiohttp, aiofiles
+-from datetime import datetime
++# ShadowLink — Telegram → Bale file bridge
++# https://github.com/CyberRhythm/ShadowLink
++#
++# Professional rewrite: robust error handling, pre-download size guard
++# (saves bandwidth on bad connections), smart retry/backoff, FloodWait-safe
++# message editing, clean per-batch statistics, structured logging.
++
++import asyncio
++import logging
++import os
++import sys
++import tempfile
+ from collections import deque
+-import pytz, jdatetime
++from datetime import datetime
++
++import aiohttp
++import aiofiles
++import pytz
++import jdatetime
+ from dotenv import load_dotenv
+ 
++# ── Configuration ─────────────────────────────────────────────
+ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+ 
+-TELEGRAM_TOKEN        = os.getenv("TELEGRAM_TOKEN")
+-BALE_TOKEN            = os.getenv("BALE_TOKEN")
+-ALLOWED_TELEGRAM_USER = int(os.getenv("ALLOWED_TELEGRAM_USER"))
+-ALLOWED_BALE_USER     = int(os.getenv("ALLOWED_BALE_USER"))
+-LOG_FILE              = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "bot.log"))
++
++def _require_int(name: str) -> int:
++    """Read a mandatory integer env var, failing fast with a clear message."""
++    raw = os.getenv(name)
++    if raw is None or raw.strip() == "":
++        sys.exit(f"[FATAL] Missing required env var: {name}")
++    try:
++        return int(raw.strip())
++    except ValueError:
++        sys.exit(f"[FATAL] Env var {name} must be an integer, got: {raw!r}")
++
++
++def _require_str(name: str) -> str:
++    raw = os.getenv(name)
++    if not raw or not raw.strip():
++        sys.exit(f"[FATAL] Missing required env var: {name}")
++    return raw.strip()
++
++
++TELEGRAM_TOKEN = _require_str("TELEGRAM_TOKEN")
++BALE_TOKEN = _require_str("BALE_TOKEN")
++ALLOWED_TELEGRAM_USER = _require_int("ALLOWED_TELEGRAM_USER")
++ALLOWED_BALE_USER = _require_int("ALLOWED_BALE_USER")
++LOG_FILE = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "bot.log"))
++
++# Telegram Bot API can only download files up to 20 MB via getFile.
++# Bale's sendDocument practically rejects very large files too.
++# We pre-check the size so we NEVER waste bandwidth downloading something
++# we cannot forward — this is the core fix for poor-connectivity users.
++TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024          # 20 MB hard API limit
++BALE_UPLOAD_LIMIT = int(os.getenv("BALE_UPLOAD_LIMIT", str(50 * 1024 * 1024)))  # 50 MB default
+ 
+ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+-BALE_API     = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
+-IRAN_TZ      = pytz.timezone("Asia/Tehran")
++BALE_API = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
++IRAN_TZ = pytz.timezone("Asia/Tehran")
+ 
+-BLOCKED_EXT = {".apk",".exe",".msi",".bat",".cmd",".sh",".deb",".rpm",".dmg",".pkg",".ipa"}
++BLOCKED_EXT = {".apk", ".exe", ".msi", ".bat", ".cmd", ".sh",
++               ".deb", ".rpm", ".dmg", ".pkg", ".ipa"}
+ 
+-logging.basicConfig(level=logging.INFO,
++logging.basicConfig(
++    level=logging.INFO,
+     format="%(asctime)s [%(levelname)s] %(message)s",
+-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()])
+-log = logging.getLogger(__name__)
+-
+-FILE_QUEUE = deque()
++    handlers=[
++        logging.FileHandler(LOG_FILE, encoding="utf-8"),
++        logging.StreamHandler(),
++    ],
++)
++log = logging.getLogger("shadowlink")
++
++# ── Shared state ──────────────────────────────────────────────
++FILE_QUEUE: "deque[dict]" = deque()
+ QUEUE_LOCK = asyncio.Lock()
+-SEND_SEM   = asyncio.Semaphore(1)
+ 
+-def iran_now():
++# ── Helpers ───────────────────────────────────────────────────
++def iran_now() -> str:
+     now = datetime.now(IRAN_TZ)
+     jdt = jdatetime.datetime.fromgregorian(datetime=now)
+-    months = ["","فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"]
+-    days   = ["دوشنبه","سه‌شنبه","چهارشنبه","پنج‌شنبه","جمعه","شنبه","یکشنبه"]
+-    return f"{days[now.weekday()]} {jdt.day} {months[jdt.month]} {jdt.year}  ساعت {jdt.hour:02d}:{jdt.minute:02d}:{jdt.second:02d}"
++    months = ["", "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
++              "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
++    # datetime.weekday(): 0=Monday … 6=Sunday
++    days = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنج‌شنبه", "جمعه", "شنبه", "یکشنبه"]
++    return (f"{days[now.weekday()]} {jdt.day} {months[jdt.month]} {jdt.year}"
++            f"  ساعت {jdt.hour:02d}:{jdt.minute:02d}:{jdt.second:02d}")
+ 
+-def pbar(cur, tot, w=12):
+-    f = int(w*cur/tot) if tot else 0
+-    return f"[{'█'*f}{'░'*(w-f)}] {int(100*cur/tot) if tot else 0}%"
+ 
+-def safe_name(n):
+-    _, e = os.path.splitext(n.lower())
+-    return (n+".bin", True) if e in BLOCKED_EXT else (n, False)
++def human_size(num: float) -> str:
++    for unit in ("B", "KB", "MB", "GB", "TB"):
++        if num < 1024 or unit == "TB":
++            return f"{num:.1f} {unit}"
++        num /= 1024
++    return f"{num:.1f} TB"
++
++
++def pbar(cur: int, tot: int, w: int = 12) -> str:
++    filled = int(w * cur / tot) if tot else 0
++    pct = int(100 * cur / tot) if tot else 0
++    return f"[{'█' * filled}{'░' * (w - filled)}] {pct}%"
++
++
++def safe_name(name: str):
++    """Append .bin to extensions Bale would reject. Returns (new_name, renamed)."""
++    _, ext = os.path.splitext(name.lower())
++    if ext in BLOCKED_EXT:
++        return name + ".bin", True
++    return name, False
++
++
++# ── Telegram messaging (resilient) ────────────────────────────
++async def _post_json(session, endpoint: str, payload: dict, timeout: int = 15):
++    """POST JSON to Telegram with basic 429/FloodWait awareness."""
++    for attempt in range(1, 4):
++        try:
++            async with session.post(endpoint, json=payload,
++                                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
++                data = await r.json()
++                if r.status == 429:
++                    retry_after = data.get("parameters", {}).get("retry_after", 2)
++                    log.warning("Telegram 429, sleeping %ss", retry_after)
++                    await asyncio.sleep(retry_after + 1)
++                    continue
++                return data
++        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
++            log.warning("telegram post error (try %d): %s", attempt, e)
++            await asyncio.sleep(1.5 * attempt)
++    return None
++
++
++async def send_msg(session, text: str):
++    data = await _post_json(session, f"{TELEGRAM_API}/sendMessage",
++                            {"chat_id": ALLOWED_TELEGRAM_USER, "text": text,
++                             "parse_mode": "Markdown"})
++    if data and data.get("ok"):
++        return data["result"]["message_id"]
++    return None
+ 
+-async def send_msg(s, text):
+-    try:
+-        async with s.post(f"{TELEGRAM_API}/sendMessage",
+-            json={"chat_id":ALLOWED_TELEGRAM_USER,"text":text,"parse_mode":"Markdown"},
+-            timeout=aiohttp.ClientTimeout(total=15)) as r:
+-            d = await r.json()
+-            return d["result"]["message_id"] if d.get("ok") else None
+-    except: return None
+-
+-async def edit_msg(s, mid, text):
+-    try:
+-        async with s.post(f"{TELEGRAM_API}/editMessageText",
+-            json={"chat_id":ALLOWED_TELEGRAM_USER,"message_id":mid,"text":text,"parse_mode":"Markdown"},
+-            timeout=aiohttp.ClientTimeout(total=15)) as r: pass
+-    except: pass
+ 
+-async def dl(s, fid, dest):
++async def edit_msg(session, message_id, text: str):
++    if message_id is None:
++        return
++    await _post_json(session, f"{TELEGRAM_API}/editMessageText",
++                     {"chat_id": ALLOWED_TELEGRAM_USER, "message_id": message_id,
++                      "text": text, "parse_mode": "Markdown"})
++
++
++# ── File transfer ─────────────────────────────────────────────
++async def get_file_path(session, file_id: str):
++    """Resolve a Telegram file_id to its download path (also exposes size)."""
++    data = await _post_json(session, f"{TELEGRAM_API}/getFile",
++                            {"file_id": file_id}, timeout=30)
++    if not data or not data.get("ok"):
++        return None, None
++    result = data["result"]
++    return result.get("file_path"), result.get("file_size")
++
++
++async def download(session, file_path: str, dest: str) -> bool:
++    url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+     try:
+-        async with s.get(f"{TELEGRAM_API}/getFile", params={"file_id":fid},
+-            timeout=aiohttp.ClientTimeout(total=30)) as r:
+-            d = await r.json()
+-            if not d.get("ok"): return False
+-            fp = d["result"]["file_path"]
+-        async with s.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fp}",
+-            timeout=aiohttp.ClientTimeout(total=600)) as r:
+-            if r.status != 200: return False
+-            async with aiofiles.open(dest,"wb") as f:
+-                async for chunk in r.content.iter_chunked(131072): await f.write(chunk)
++        async with session.get(url, timeout=aiohttp.ClientTimeout(total=600)) as r:
++            if r.status != 200:
++                log.error("download HTTP %s", r.status)
++                return False
++            async with aiofiles.open(dest, "wb") as f:
++                async for chunk in r.content.iter_chunked(131072):
++                    await f.write(chunk)
+         return True
+-    except Exception as e: log.error("dl error: %s", e); return False
++    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
++        log.error("download error: %s", e)
++        return False
+ 
+-async def ul(s, path, name, cap=""):
+-    for attempt in range(1,4):
++
++async def upload_to_bale(session, path: str, name: str, caption: str = "") -> bool:
++    """Upload to Bale with exponential backoff retry."""
++    for attempt in range(1, 4):
+         try:
+-            async with aiofiles.open(path,"rb") as f: data = await f.read()
++            async with aiofiles.open(path, "rb") as f:
++                data = await f.read()
+             form = aiohttp.FormData()
+             form.add_field("chat_id", str(ALLOWED_BALE_USER))
+-            form.add_field("document", data, filename=name, content_type="application/octet-stream")
+-            if cap: form.add_field("caption", cap)
+-            async with s.post(f"{BALE_API}/sendDocument", data=form,
+-                timeout=aiohttp.ClientTimeout(total=600)) as r:
+-                d = await r.json()
+-                if d.get("ok"): return True
+-                log.warning("bale reject (try %d): %s", attempt, d)
+-        except Exception as e: log.error("ul error (try %d): %s", attempt, e)
+-        await asyncio.sleep(3*attempt)
++            form.add_field("document", data, filename=name,
++                           content_type="application/octet-stream")
++            if caption:
++                form.add_field("caption", caption)
++            async with session.post(f"{BALE_API}/sendDocument", data=form,
++                                    timeout=aiohttp.ClientTimeout(total=600)) as r:
++                resp = await r.json()
++                if resp.get("ok"):
++                    return True
++                log.warning("bale rejected (try %d): %s", attempt, resp)
++        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
++            log.error("upload error (try %d): %s", attempt, e)
++        await asyncio.sleep(3 * attempt)  # 3s, 6s, 9s backoff
+     return False
+ 
+-def extract(msg):
+-    cap = msg.get("caption","")
+-    for k in ["document","video","audio","voice","animation"]:
+-        if k in msg:
+-            o = msg[k]; n = o.get("file_name") or f"{k}_{o['file_unique_id']}"
+-            return {"file_id":o["file_id"],"file_name":n,"caption":cap}
++
++def extract_file(msg: dict):
++    """Pull a forwardable file descriptor (incl. size) out of a Telegram message."""
++    caption = msg.get("caption", "")
++    for key in ("document", "video", "audio", "voice", "animation"):
++        if key in msg:
++            obj = msg[key]
++            name = obj.get("file_name") or f"{key}_{obj.get('file_unique_id', 'file')}"
++            return {"file_id": obj["file_id"], "file_name": name,
++                    "file_size": obj.get("file_size", 0), "caption": caption}
+     if "photo" in msg:
+-        best = max(msg["photo"], key=lambda p: p.get("file_size",0))
+-        return {"file_id":best["file_id"],"file_name":"photo.jpg","caption":cap}
++        best = max(msg["photo"], key=lambda p: p.get("file_size", 0))
++        return {"file_id": best["file_id"], "file_name": "photo.jpg",
++                "file_size": best.get("file_size", 0), "caption": caption}
+     return None
+ 
+-async def worker(s):
++
++# ── Queue worker ──────────────────────────────────────────────
++async def worker(session):
++    """Process queued files one-by-one and report batch results."""
+     log.info("queue worker ready")
+-    mid=None; done=0; ok=0; fail=0
++    status_mid = None
++    done = ok = fail = 0
++
+     while True:
+-        if not FILE_QUEUE: await asyncio.sleep(0.3); continue
+-        async with SEND_SEM:
+-            async with QUEUE_LOCK:
+-                if not FILE_QUEUE: continue
+-                item = FILE_QUEUE.popleft()
+-            fn=item["file_name"]; fid=item["file_id"]; cap=item.get("caption","")
+-            now=iran_now(); rem=len(FILE_QUEUE)
+-            bn, renamed = safe_name(fn)
+-            fc = cap
+-            if renamed:
+-                note = f"⚠️ نام اصلی: {fn}\nپسوند .bin را از انتهای نام حذف کنید"
+-                fc = (cap+"\n\n"+note).strip() if cap else note
+-            log.info("processing: %s (queue: %d)", fn, rem)
+-            qi = f"\n📋 {rem} فایل دیگر در صف" if rem>0 else ""
+-            live = f"⬇️ *در حال دانلود...*\n\n📄 `{fn}`{qi}\n🕐 {now}"
+-            if mid is None: mid = await send_msg(s, live)
+-            else: await edit_msg(s, mid, live)
+-            ext = os.path.splitext(fn)[1] or ".bin"
+-            tmp = tempfile.mktemp(suffix=ext)
+-            got = await dl(s, fid, tmp)
+-            if not got:
+-                fail+=1; done+=1
+-                if mid: await edit_msg(s, mid, f"❌ *دانلود ناموفق*\n\n📄 `{fn}`\n🕐 {iran_now()}")
+-                if len(FILE_QUEUE)==0: mid=None; done=0; ok=0; fail=0
++        if not FILE_QUEUE:
++            await asyncio.sleep(0.3)
++            continue
++
++        async with QUEUE_LOCK:
++            if not FILE_QUEUE:
+                 continue
+-            qi = f"\n📋 {rem} فایل دیگر در صف" if rem>0 else ""
+-            if mid: await edit_msg(s, mid, f"📤 *در حال ارسال به بله...*\n\n📄 `{fn}`{qi}\n🕐 {now}")
+-            sent = await ul(s, tmp, bn, fc)
+-            try: os.unlink(tmp)
+-            except: pass
+-            done+=1
+-            if sent: ok+=1; log.info("✅ %s", fn)
+-            else: fail+=1; log.error("❌ %s", fn)
+-            fnow=iran_now(); rnow=len(FILE_QUEUE)
+-            if rnow==0:
+-                if done==1:
+-                    if sent:
+-                        f2 = f"✅ *ارسال موفق بود*\n\n📄 `{fn}`\n"
+-                        if renamed: f2 += f"⚠️ پسوند تغییر کرد: `{bn}`\n"
+-                        f2 += f"🕐 {fnow}"
+-                    else: f2 = f"❌ *ارسال ناموفق بود*\n\n📄 `{fn}`\n🕐 {fnow}"
++            item = FILE_QUEUE.popleft()
++
++        file_name = item["file_name"]
++        file_id = item["file_id"]
++        caption = item.get("caption", "")
++        declared_size = item.get("file_size", 0)
++        remaining = len(FILE_QUEUE)
++        bale_name, renamed = safe_name(file_name)
++
++        log.info("processing: %s (%s, queue:%d)",
++                 file_name, human_size(declared_size), remaining)
++
++        queue_note = f"\n📋 {remaining} فایل دیگر در صف" if remaining else ""
++
++        # ── Pre-download size guard (the core bandwidth fix) ──
++        if declared_size and declared_size > TELEGRAM_DOWNLOAD_LIMIT:
++            done += 1
++            fail += 1
++            text = (f"⚠️ *فایل خیلی بزرگ است*\n\n📄 `{file_name}`\n"
++                    f"📦 حجم: `{human_size(declared_size)}`\n"
++                    f"❗️ تلگرام اجازه دانلود فایل بزرگ‌تر از "
++                    f"`{human_size(TELEGRAM_DOWNLOAD_LIMIT)}` را با ربات نمی‌دهد.\n"
++                    f"💡 از بخش Tele2Server برای تقسیم فایل استفاده کنید.\n🕐 {iran_now()}")
++            status_mid = (await send_msg(session, text)
++                          if status_mid is None else status_mid)
++            await edit_msg(session, status_mid, text)
++            if not FILE_QUEUE:
++                status_mid = None; done = ok = fail = 0
++            continue
++
++        # ── Resolve file path & verify real size ──
++        live = f"⬇️ *در حال دانلود...*\n\n📄 `{file_name}`{queue_note}\n🕐 {iran_now()}"
++        if status_mid is None:
++            status_mid = await send_msg(session, live)
++        else:
++            await edit_msg(session, status_mid, live)
++
++        file_path, real_size = await get_file_path(session, file_id)
++        if file_path is None:
++            done += 1; fail += 1
++            await edit_msg(session, status_mid,
++                           f"❌ *دانلود ناموفق*\n\n📄 `{file_name}`\n"
++                           f"❗️ احتمالاً فایل بزرگ‌تر از حد مجاز تلگرام است.\n🕐 {iran_now()}")
++            if not FILE_QUEUE:
++                status_mid = None; done = ok = fail = 0
++            continue
++
++        ext = os.path.splitext(file_name)[1] or ".bin"
++        fd, tmp = tempfile.mkstemp(suffix=ext)
++        os.close(fd)  # we only need the unique path; aiofiles reopens it
++
++        got = await download(session, file_path, tmp)
++        if not got:
++            done += 1; fail += 1
++            _safe_unlink(tmp)
++            await edit_msg(session, status_mid,
++                           f"❌ *دانلود ناموفق*\n\n📄 `{file_name}`\n🕐 {iran_now()}")
++            if not FILE_QUEUE:
++                status_mid = None; done = ok = fail = 0
++            continue
++
++        # ── Upload to Bale ──
++        await edit_msg(session, status_mid,
++                       f"📤 *در حال ارسال به بله...*\n\n📄 `{file_name}`{queue_note}\n🕐 {iran_now()}")
++
++        bale_caption = caption
++        if renamed:
++            note = f"⚠️ نام اصلی: {file_name}\nپسوند .bin را از انتهای نام حذف کنید"
++            bale_caption = (caption + "\n\n" + note).strip() if caption else note
++
++        sent = await upload_to_bale(session, tmp, bale_name, bale_caption)
++        _safe_unlink(tmp)
++
++        done += 1
++        if sent:
++            ok += 1; log.info("✅ sent: %s", file_name)
++        else:
++            fail += 1; log.error("❌ failed: %s", file_name)
++
++        # ── Report ──
++        remaining = len(FILE_QUEUE)
++        if remaining == 0:
++            if done == 1:
++                if sent:
++                    final = f"✅ *ارسال موفق بود*\n\n📄 `{file_name}`\n"
++                    if renamed:
++                        final += f"⚠️ پسوند تغییر کرد: `{bale_name}`\n"
++                    final += f"🕐 {iran_now()}"
+                 else:
+-                    st = "✅ تمام ارسال‌ها موفق بودند" if fail==0 else f"⚠️ {ok} موفق — {fail} ناموفق"
+-                    f2 = f"📦 *نتیجه ارسال {done} فایل*\n\n{pbar(ok,done)}  {ok} از {done}\n\n{st}\n🕐 {fnow}"
+-                if mid: await edit_msg(s, mid, f2)
+-                mid=None; done=0; ok=0; fail=0
++                    final = f"❌ *ارسال ناموفق بود*\n\n📄 `{file_name}`\n🕐 {iran_now()}"
+             else:
+-                icon="✅" if sent else "❌"
+-                if mid: await edit_msg(s, mid,
+-                    f"{icon} `{fn}`\n\n⏳ *{rnow} فایل دیگر در صف...*\n✅ {ok} موفق  ❌ {fail} ناموفق\n🕐 {fnow}")
+-
+-async def get_updates(s, offset):
++                summary = ("✅ تمام ارسال‌ها موفق بودند" if fail == 0
++                           else f"⚠️ {ok} موفق — {fail} ناموفق")
++                final = (f"📦 *نتیجه ارسال {done} فایل*\n\n"
++                         f"{pbar(ok, done)}  {ok} از {done}\n\n{summary}\n🕐 {iran_now()}")
++            await edit_msg(session, status_mid, final)
++            status_mid = None; done = ok = fail = 0
++        else:
++            icon = "✅" if sent else "❌"
++            await edit_msg(session, status_mid,
++                           f"{icon} `{file_name}`\n\n⏳ *{remaining} فایل دیگر در صف...*\n"
++                           f"✅ {ok} موفق  ❌ {fail} ناموفق\n🕐 {iran_now()}")
++
++
++def _safe_unlink(path: str):
+     try:
+-        async with s.get(f"{TELEGRAM_API}/getUpdates",
+-            params={"offset":offset,"timeout":30},
+-            timeout=aiohttp.ClientTimeout(total=40)) as r:
+-            d = await r.json()
+-            return d.get("result",[]) if d.get("ok") else []
+-    except Exception as e: log.error("getUpdates: %s", e); return []
++        os.unlink(path)
++    except OSError:
++        pass
++
++
++# ── Update polling ────────────────────────────────────────────
++async def get_updates(session, offset: int):
++    data = await _post_json(session, f"{TELEGRAM_API}/getUpdates",
++                            {"offset": offset, "timeout": 30}, timeout=40)
++    if data and data.get("ok"):
++        return data["result"]
++    return []
++
+ 
+ async def main():
+-    log.info("ShadowLink started 🚀 | TG:%s | Bale:%s", ALLOWED_TELEGRAM_USER, ALLOWED_BALE_USER)
+-    offset=0
+-    async with aiohttp.ClientSession() as s:
+-        asyncio.create_task(worker(s))
++    log.info("ShadowLink started 🚀 | TG:%s → Bale:%s",
++             ALLOWED_TELEGRAM_USER, ALLOWED_BALE_USER)
++    offset = 0
++    async with aiohttp.ClientSession() as session:
++        # Drop any backlog so we don't reprocess old files on restart.
++        async with session.get(f"{TELEGRAM_API}/getUpdates",
++                                params={"offset": -1},
++                                timeout=aiohttp.ClientTimeout(total=15)) as r:
++            try:
++                d = await r.json()
++                if d.get("ok") and d["result"]:
++                    offset = d["result"][-1]["update_id"] + 1
++            except (aiohttp.ContentTypeError, KeyError, IndexError):
++                pass
++
++        asyncio.create_task(worker(session))
+         while True:
+-            updates = await get_updates(s, offset)
++            updates = await get_updates(session, offset)
+             for u in updates:
+-                offset = u["update_id"]+1
++                offset = u["update_id"] + 1
+                 msg = u.get("message")
+-                if not msg: continue
+-                if msg.get("from",{}).get("id") != ALLOWED_TELEGRAM_USER: continue
+-                fi = extract(msg)
+-                if not fi: continue
+-                async with QUEUE_LOCK: FILE_QUEUE.append(fi)
+-                log.info("queued: %s (%d)", fi["file_name"], len(FILE_QUEUE))
+-            if not updates: await asyncio.sleep(0.3)
++                if not msg:
++                    continue
++                if msg.get("from", {}).get("id") != ALLOWED_TELEGRAM_USER:
++                    continue
++                file_info = extract_file(msg)
++                if not file_info:
++                    continue
++                async with QUEUE_LOCK:
++                    FILE_QUEUE.append(file_info)
++                log.info("queued: %s (queue:%d)", file_info["file_name"], len(FILE_QUEUE))
++            if not updates:
++                await asyncio.sleep(0.3)
++
+ 
+ if __name__ == "__main__":
+-    asyncio.run(main())
++    try:
++        asyncio.run(main())
++    except KeyboardInterrupt:
++        log.info("ShadowLink stopped by user")
+ BOTEOF
+ }
+ 
+@@ -294,9 +506,28 @@ do_install() {
+     echo ""
+ 
+     ask "Telegram Bot Token :" TG_TOKEN
++    while ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; do
++        print_warn "Invalid token format. Should look like: 123456789:AAF..."
++        ask "Telegram Bot Token :" TG_TOKEN
++    done
++
+     ask "Telegram User ID   :" TG_UID
++    while ! [[ "$TG_UID" =~ ^[0-9]+$ ]]; do
++        print_warn "User ID must be a number."
++        ask "Telegram User ID   :" TG_UID
++    done
++
+     ask "Bale Bot Token     :" BALE_TOKEN
++    while [ -z "$BALE_TOKEN" ]; do
++        print_warn "Bale token is required."
++        ask "Bale Bot Token     :" BALE_TOKEN
++    done
++
+     ask "Bale User ID       :" BALE_UID
++    while ! [[ "$BALE_UID" =~ ^[0-9]+$ ]]; do
++        print_warn "User ID must be a number."
++        ask "Bale User ID       :" BALE_UID
++    done
+ 
+     echo ""
+     divider
+-- 
+2.47.3
+
